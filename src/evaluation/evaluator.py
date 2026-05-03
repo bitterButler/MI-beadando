@@ -14,7 +14,6 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-from src.data.dataset import CLASS_NAMES
 from src.training.trainer import evaluate_one_epoch
 
 
@@ -24,6 +23,7 @@ def full_evaluation(
     criterion: nn.Module,
     device: torch.device,
     model_name: str,
+    class_names=None
 ) -> dict:
     """
     Teljes kiertekeles a teszt halmazon.
@@ -60,7 +60,7 @@ def full_evaluation(
     f1_weighted = f1_score(labels, preds, average="weighted", zero_division=0)
     cm = confusion_matrix(labels, preds)
     report = classification_report(
-        labels, preds, target_names=CLASS_NAMES, zero_division=0
+        labels, preds, target_names=class_names, zero_division=0
     )
 
     print(f"Teszt veszteseg:   {test_loss:.4f}")

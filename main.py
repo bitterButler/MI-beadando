@@ -19,7 +19,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from src.data.dataset import create_dataloaders, NUM_CLASSES
+from src.data.dataset import create_dataloaders as create_coco_dataloaders
+from src.data.dataset import NUM_CLASSES
 from src.models.custom_cnn import CustomCNN
 from src.models.resnet_model import (
     get_resnet_frozen,
@@ -50,16 +51,16 @@ def get_device() -> torch.device:
     return device
 
 
-def build_model(model_type: str, device: torch.device) -> nn.Module:
+def build_model(model_type: str, device: torch.device, num_classes: int) -> nn.Module:
     """Letrehozza a kivalasztott modellt es GPU/CPU-ra koltozeti."""
     if model_type == "cnn":
-        model = CustomCNN(num_classes=NUM_CLASSES)
+        model = CustomCNN(num_classes=num_classes)
         trainable = model.count_parameters()
         print(f"Custom CNN: {trainable:,} tanithato parameter")
     elif model_type == "resnet_frozen":
-        model = get_resnet_frozen(num_classes=NUM_CLASSES)
+        model = get_resnet_frozen(num_classes=num_classes)
     elif model_type == "resnet_finetune":
-        model = get_resnet_finetuned(num_classes=NUM_CLASSES)
+        model = get_resnet_finetuned(num_classes=num_classes)
     else:
         raise ValueError(f"Ismeretlen modell tipus: {model_type!r}")
     return model.to(device)
@@ -69,6 +70,7 @@ def build_optimizer(
     model: nn.Module,
     model_type: str,
     lr: float,
+    weight_decay: float,
 ) -> optim.Optimizer:
     """
     AdamW optimalizalo keszitese.
@@ -82,7 +84,7 @@ def build_optimizer(
         param_groups = [
             {"params": filter(lambda p: p.requires_grad, model.parameters())}
         ]
-    return optim.AdamW(param_groups, lr=lr, weight_decay=1e-4)
+    return optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
 
 
 def get_data_paths(data_dir: str) -> tuple[Path, Path]:
@@ -121,16 +123,29 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 def cmd_train(args: argparse.Namespace) -> None:
     device = get_device()
-    images_dir, ann_file = get_data_paths(args.data_dir)
+    if args.dataset == "oxford":
+        from src.data.oxford_dataset import create_dataloaders, NUM_CLASSES as NC
+        import torchvision.datasets as tvd
+        _ds = tvd.OxfordIIITPet(root=args.data_dir, split="trainval", download=False)
+        EVAL_CLASS_NAMES = _ds.classes
+    else:
+        from src.data.dataset import create_dataloaders, NUM_CLASSES as NC, CLASS_NAMES
+        EVAL_CLASS_NAMES = CLASS_NAMES
+        images_dir, ann_file = get_data_paths(args.data_dir)
 
-    train_loader, val_loader, test_loader = create_dataloaders(
-        images_dir, ann_file,
+    if args.dataset == "oxford":
+        train_loader, val_loader, test_loader = create_dataloaders(
+        args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
-
-    model = build_model(args.model, device)
-    optimizer = build_optimizer(model, args.model, args.lr)
+    else:
+        train_loader, val_loader, test_loader = create_dataloaders(
+            images_dir, ann_file,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+        )
+    model = build_model(args.model, device, num_classes=NC)
+    optimizer = build_optimizer(model, args.model, args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=3, factor=0.5,
     )
@@ -143,11 +158,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         device, args.epochs,
         save_dir=args.checkpoint_dir,
         model_name=args.model,
+        patience=args.patience,
     )
 
     # Legjobb checkpoint betoltese es teszt kiertekeles
     model = load_best_checkpoint(model, args.checkpoint_dir, args.model, device)
-    results = full_evaluation(model, test_loader, criterion, device, display_name)
+    results = full_evaluation(model, test_loader, criterion, device, display_name, class_names=EVAL_CLASS_NAMES)
 
     os.makedirs("results", exist_ok=True)
     plot_training_curves([history], [display_name], save_dir="results")
@@ -164,13 +180,24 @@ def cmd_compare(args: argparse.Namespace) -> None:
     Mind a harom modell tanítasa, kiertekelesee es osszehasonlitasa.
     """
     device = get_device()
-    images_dir, ann_file = get_data_paths(args.data_dir)
+    if args.dataset == "oxford":
+        from src.data.oxford_dataset import create_dataloaders, NUM_CLASSES as NC
+        import torchvision.datasets as tvd                                    
+        _ds = tvd.OxfordIIITPet(root=args.data_dir, split="trainval",        
+                                 download=False)                              
+        EVAL_CLASS_NAMES = _ds.classes
+        train_loader, val_loader, test_loader = create_dataloaders(
+            args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers
+        )
+    else:
+        from src.data.dataset import create_dataloaders, NUM_CLASSES as NC, CLASS_NAMES
+        EVAL_CLASS_NAMES = CLASS_NAMES   
+        images_dir, ann_file = get_data_paths(args.data_dir)
+        train_loader, val_loader, test_loader = create_dataloaders(
+            images_dir, ann_file,
+            batch_size=args.batch_size, num_workers=args.num_workers,
+        )
 
-    train_loader, val_loader, test_loader = create_dataloaders(
-        images_dir, ann_file,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
     criterion = nn.CrossEntropyLoss()
 
     # (model_type, tanulasi_rata)
@@ -189,8 +216,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
         sep = "=" * 60
         print(f"\n{sep}\n  {display_name}\n{sep}")
 
-        model = build_model(model_type, device)
-        optimizer = build_optimizer(model, model_type, lr)
+        model = build_model(model_type, device, num_classes=NC)
+        optimizer = build_optimizer(model, model_type, lr, weight_decay=args.weight_decay)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", patience=3, factor=0.5,
         )
@@ -201,10 +228,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
             device, args.epochs,
             save_dir=args.checkpoint_dir,
             model_name=model_type,
+            patience=args.patience,
         )
 
         model = load_best_checkpoint(model, args.checkpoint_dir, model_type, device)
-        results = full_evaluation(model, test_loader, criterion, device, display_name)
+        results = full_evaluation(model, test_loader, criterion, device, display_name, class_names=EVAL_CLASS_NAMES)
 
         plot_confusion_matrix(
             results["confusion_matrix"],
@@ -271,6 +299,11 @@ def build_parser() -> argparse.ArgumentParser:
     tr.add_argument("--checkpoint-dir",             default="./checkpoints")
     tr.add_argument("--num-workers",    type=int,   default=0,
                     help="DataLoader worker szam (Windows-on 0 ajanlott)")
+    tr.add_argument("--weight-decay",   type=float, default=3e-4,
+                    help="AdamW weight decay (L2 regularizacio) egyuttmukodese resnet modellekkel")
+    tr.add_argument("--patience",      type=int,   default=7 )
+    tr.add_argument("--dataset", choices=["coco", "oxford"], default="coco",
+                help="Adathalmaz tipusa (coco vagy oxford)")
 
     # ---- compare ----
     cp = sub.add_parser("compare", help="Mind a harom modell osszehasonlitasa")
@@ -285,6 +318,10 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--data-dir",                   default="./data")
     cp.add_argument("--checkpoint-dir",             default="./checkpoints")
     cp.add_argument("--num-workers",    type=int,   default=0)
+    cp.add_argument("--patience",     type=int,   default=12)
+    cp.add_argument("--weight-decay", type=float, default=3e-4)
+    cp.add_argument("--dataset", choices=["coco", "oxford"], default="coco",
+                help="Adathalmaz tipusa (coco vagy oxford)")
 
     return parser
 
